@@ -12,6 +12,9 @@ for the unobserved target model weights.
 Also scores the white-box reference: the whitebox classifiers from Block 3
 applied to the target's own loss features (Block 0).
 
+Before scoring, the proxy's (target's) features are calibrated per patient
+against the same K synth-shadows (base shadows) the classifier was trained on.
+
 Outputs saved to output_dir/
   features/proxy.npy         -- proxy loss features (N, n_t, 2, n_budgets, 7)
   inference_scores_{view}.npy -- membership scores per patient (N,), largest K
@@ -34,7 +37,7 @@ import matplotlib.pyplot as plt
 from midst_common import (DATASETS, PROBE, parse_cli, load_attack_pool,
                           cat_idx, minmax, normalize, train_probe,
                           loss_features, flat_features, features_dir,
-                          T_GRID)
+                          calibrate, T_GRID)
 
 
 # =============================================================================
@@ -161,14 +164,20 @@ def main():
 
     attack_features = {"blackbox": F,
                        "whitebox": np.load(os.path.join(features_dir(cfg), "target.npy"))}
+    reference = {"blackbox": "ss", "whitebox": "sh"}   # shadow files each view calibrates against
     summary = {}
     for view, FF in attack_features.items():
         # score with every meta-classifier from Block 3 (one per shadow count K)
         X_attack = flat_features(FF)
+        d = features_dir(cfg)
+        ks = sorted(int(f[2:4]) for f in os.listdir(d) if f.startswith(reference[view]))
         summary[view] = {}
         for p in classifiers(view):
             K = int(p.split("_K")[-1].split(".")[0])
-            scores = joblib.load(p).predict_proba(X_attack)[:, 1]
+            # calibrate against the same K shadows the classifier was trained on
+            ref = np.stack([flat_features(np.load(os.path.join(d, f"{reference[view]}{k:02d}.npy")))
+                            for k in ks[:K]])
+            scores = joblib.load(p).predict_proba(calibrate(X_attack, ref))[:, 1]
             print(f"\n[eval] {view}  K={K} shadows")
             res = evaluate(scores, y_member)
             summary[view][K] = {k: v for k, v in res.items() if k not in ("fpr", "tpr")}

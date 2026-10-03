@@ -5,7 +5,9 @@ Reads the synth-shadow loss features and labels from Block 2 and trains a
 gradient-boosted tree classifier (LightGBM) on every (patient, shadow) pair:
 
     M: R^d -> P(member)
-    input  = the patient's loss summaries under synth-shadow k
+    input  = the patient's loss summaries under synth-shadow k, calibrated
+             per patient against the patient's values in the other shadows
+             (midst_common.calibrate)
     output = membership probability
 
 One classifier is trained per shadow count in K_SWEEP (first K shadows), so
@@ -23,10 +25,9 @@ Run next: MIDST_block4_mimic.py
 
 import os
 import joblib
-import numpy as np
 import lightgbm as lgb
 
-from midst_common import DATASETS, parse_cli, flat_features, features_dir
+from midst_common import DATASETS, parse_cli, features_dir, calibrated_training_rows
 
 
 # =============================================================================
@@ -58,17 +59,15 @@ def shadow_ids(cfg, prefix):
 
 def build_meta_dataset(cfg, ks, prefix):
     """
-    Pool the (features, label) pairs of shadows ks (files {prefix}{k}.npy).
+    Pool the calibrated (features, label) pairs of shadows ks
+    (files {prefix}{k}.npy).
 
     Returns
     -------
     features : (N*K, d)  float32
     labels   : (N*K,)    int
     """
-    d = features_dir(cfg)
-    features = np.concatenate([flat_features(np.load(os.path.join(d, f"{prefix}{k:02d}.npy")))
-                               for k in ks])
-    labels   = np.concatenate([np.load(os.path.join(d, f"lab{k:02d}.npy")) for k in ks])
+    features, labels, _ = calibrated_training_rows(cfg, prefix, ks)
     print(f"  pooled dataset : {features.shape}  "
           f"positive rate={100*labels.mean():.1f}%  (K={len(ks)} shadows)")
     return features, labels

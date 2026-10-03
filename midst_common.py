@@ -518,3 +518,29 @@ def features_dir(cfg):
     d = os.path.join(cfg["output_dir"], "features")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def calibrate(X, others, eps=1e-6):
+    """
+    Per-record difficulty calibration (Watson et al., ICLR 2022; LiRA,
+    Carlini et al., S&P 2022). X: (n, d) one model's classifier input;
+    others: (m, n, d) the same records under m other models. Each feature is
+    expressed as a z-score against that record's own values in the other
+    models, so a record that is hard for every model no longer looks like a
+    non-member: "is this loss low for this record?" instead of "is it low?".
+    """
+    return (X - others.mean(0)) / (others.std(0) + eps)
+
+
+def calibrated_training_rows(cfg, prefix, ks):
+    """
+    Classifier rows for shadows ks (feature files {prefix}{k}.npy): each
+    shadow's rows are calibrated against the OTHER shadows only (leave one
+    out), so a shadow's own membership signal is not subtracted from itself.
+    Returns (rows (K*n, d), labels (K*n,), reference stack (K, n, d)).
+    """
+    d = features_dir(cfg)
+    ref = np.stack([flat_features(np.load(os.path.join(d, f"{prefix}{k:02d}.npy"))) for k in ks])
+    lab = np.concatenate([np.load(os.path.join(d, f"lab{k:02d}.npy")) for k in ks])
+    rows = np.concatenate([calibrate(ref[i], np.delete(ref, i, 0)) for i in range(len(ks))])
+    return rows, lab, ref

@@ -33,8 +33,7 @@ CONFIG = {
 
     **DATASETS,
 
-    "K":                 32,
-    "split_train_frac":  0.5,   # must match Block 1
+    "K":                 32,    # must match Block 1
 
     # Synth-shadow training
     "shadow_num_steps":  600000,
@@ -45,9 +44,6 @@ CONFIG = {
 
     # Loss extraction
     "n_loss_samples":    20,
-
-    # must match Block 1
-    "split_seed":        42,
 
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }

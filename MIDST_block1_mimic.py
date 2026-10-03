@@ -6,7 +6,7 @@ Supports eICU (N, 9, 272) and MIMIC-IV (N, 11, 72)
 What this block does
 --------------------
   For each k = 1..K:
-    1. Sample a random split of the attacked pool -> (Dk_train, Dk_test)
+    1. Sample a random 50/50 split of the attacked pool -> (Dk_train, Dk_test)
     2. Train a BASE SHADOW GENERATOR on Dk_train (real patients) with exactly
        the target's settings (Block 0: TimeDiff recipe, same hidden size,
        steps and own-min/max normalisation), so its synthetic data looks
@@ -42,14 +42,13 @@ CONFIG = {
 
     **DATASETS,
 
-    "K":                    32,      # number of shadow models
-    "split_train_frac":     0.8,     # 80% train / 20% test
+    "K":                    32,      # number of shadow models (50/50 splits)
 
     # Base shadows use the target's recipe (midst_common.TARGET) and hidden
     # size (target_hidden), so Dk_syn is distributed like the real release.
 
     # split reproducibility -- each split k uses seed (split_seed + k)
-    "split_seed":           42,
+    "split_seed":           1000,
 
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
@@ -89,12 +88,13 @@ def main():
             print(f"  [k={k}/{K}] Already exists, skipping.")
             continue
 
-        # Step 1a: split -- use deterministic per-k seed so resuming
-        # across VM sessions always produces the same split for split k
-        rng       = np.random.RandomState(seed=cfg.get("split_seed", 42) + k)
-        perm      = rng.permutation(N)
-        train_idx = perm[:int(N * cfg["split_train_frac"])]
-        test_idx  = perm[int(N * cfg["split_train_frac"]):]
+        # Step 1a: 50/50 split, like the target's members / non-members.
+        # Deterministic per-k seed so resuming always gives the same split.
+        rng       = np.random.RandomState(seed=cfg["split_seed"] + k)
+        member    = np.zeros(N, bool)
+        member[rng.permutation(N)[:N // 2]] = True
+        train_idx = np.where(member)[0]
+        test_idx  = np.where(~member)[0]
         np.save(split_train_path, train_idx)
         np.save(split_test_path,  test_idx)
 

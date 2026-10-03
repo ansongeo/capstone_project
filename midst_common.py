@@ -518,26 +518,3 @@ def features_dir(cfg):
     d = os.path.join(cfg["output_dir"], "features")
     os.makedirs(d, exist_ok=True)
     return d
-
-
-# =============================================================================
-# META-CLASSIFIER
-# =============================================================================
-
-class MetaClassifierMLP(nn.Module):
-    """
-    Input : (batch, d)  -- loss features per (patient, shadow) pair
-    Output: (batch,)    -- raw logit for P(member)
-    """
-    def __init__(self, input_dim, hidden_sizes, dropout):
-        super().__init__()
-        layers = []
-        prev   = input_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
-            prev = h
-        layers.append(nn.Linear(prev, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)

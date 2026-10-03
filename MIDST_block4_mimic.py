@@ -1,7 +1,7 @@
 """
 MIDST MIA -- Block 4: Inference & Evaluation
 =============================================
-Reads meta_classifier.pt from Block 3 and Dsynth from Block 0.
+Reads the meta-classifiers from Block 3 and Dsynth from Block 0.
 Trains a proxy generator on released Dsynth, computes the same loss
 features as Block 2 on all of the attacked pool, applies the
 meta-classifier, and evaluates AUC.
@@ -11,7 +11,8 @@ for the unobserved target model weights.
 
 Outputs saved to output_dir/
   features/proxy.npy         -- proxy loss features (N, n_t, 2, n_budgets, 7)
-  inference_scores.npy       -- MLP logit scores per patient (N,)
+  inference_scores.npy       -- membership scores per patient (N,), largest K
+  result.json                -- AUC and TPR at low FPR for every K
   midst_roc.png
   midst_scores.png
 
@@ -19,16 +20,18 @@ Run after: MIDST_block3_mimic.py
 """
 
 import os
+import glob
+import json
+import joblib
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
 
 from midst_common import (DATASETS, PROBE, parse_cli, load_attack_pool,
                           cat_idx, minmax, normalize, train_probe,
                           loss_features, flat_features, features_dir,
-                          MetaClassifierMLP)
+                          T_GRID)
 
 
 # =============================================================================
@@ -39,11 +42,6 @@ CONFIG = {
     "dataset": "mimic",    # "eicu" | "mimic"
 
     **DATASETS,
-
-    # MLP architecture -- must match Block 3
-    "mlp_hidden":     [256, 128, 64],
-    "mlp_dropout":    0.3,
-    "mlp_batch_size": 512,
 
     # Proxy generator trained on released Dsynth: midst_common.PROBE, the
     # same overfitting settings as the synth-shadows (Block 2)
@@ -81,8 +79,8 @@ def evaluate(scores, y_member):
     print(f"  MIDST MIA  --  train (members) vs test (non-members)")
     print(f"{'='*57}")
     print(f"  AUC                     : {auc:.4f}")
-    results = {"auc": auc, "fpr": fpr, "tpr": tpr}
-    for target_fpr in [0.001, 0.005, 0.01, 0.05]:
+    results = {"auc": float(auc), "fpr": fpr, "tpr": tpr}
+    for target_fpr in [0.001, 0.005, 0.01, 0.05, 0.1]:
         idx     = max(0, np.searchsorted(fpr, target_fpr, side="right") - 1)
         tpr_val = float(tpr[idx])
         results[f"tpr@{target_fpr}"] = tpr_val
@@ -115,7 +113,7 @@ def plot_score_distributions(scores, y_member, output_dir):
     kw = dict(bins=80, alpha=0.6, density=True)
     plt.hist(m,  **kw, color="steelblue", label=f"Members     n={len(m)}")
     plt.hist(nm, **kw, color="tomato",    label=f"Non-members n={len(nm)}")
-    plt.xlabel("Meta-classifier score (logit)")
+    plt.xlabel("Meta-classifier score (P(member))")
     plt.ylabel("Density")
     plt.title("MIDST MIA -- Score distributions")
     plt.legend()
@@ -140,9 +138,9 @@ def main():
     print("\n[load] Loading data ...")
     X_real, y_member, X_syn_raw, (pool_mn, pool_mx) = load_all_data(cfg)
 
-    clf_path = os.path.join(cfg["output_dir"], "meta_classifier.pt")
-    assert os.path.exists(clf_path), \
-        f"Missing {clf_path} -- run Block 3 first."
+    clf_paths = sorted(glob.glob(os.path.join(cfg["output_dir"], "meta_classifier_K*.joblib")),
+                       key=lambda p: int(p.split("_K")[-1].split(".")[0]))
+    assert clf_paths, "No meta_classifier_K*.joblib -- run Block 3 first."
 
     # train proxy generator on released Dsynth
     # proxy substitutes for the unobserved target model weights
@@ -158,42 +156,32 @@ def main():
     del proxy
     X_attack = flat_features(F)
 
-    # load meta-classifier saved by Block 3
-    meta_clf = MetaClassifierMLP(
-        input_dim    = X_attack.shape[1],
-        hidden_sizes = cfg["mlp_hidden"],
-        dropout      = cfg["mlp_dropout"],
-    )
-    meta_clf.load_state_dict(torch.load(clf_path, map_location="cpu"))
-    meta_clf.eval()
-    print(f"  Loaded meta-classifier from {clf_path}")
+    # score with every meta-classifier from Block 3 (one per shadow count K)
+    summary = {}
+    for p in clf_paths:
+        K = int(p.split("_K")[-1].split(".")[0])
+        scores = joblib.load(p).predict_proba(X_attack)[:, 1]
+        print(f"\n[eval] K={K} shadows")
+        res = evaluate(scores, y_member)
+        summary[K] = {k: v for k, v in res.items() if k not in ("fpr", "tpr")}
 
-    # score with meta-classifier
-    meta_clf = meta_clf.to(device)
-    scores   = []
-    loader   = DataLoader(
-        TensorDataset(torch.from_numpy(X_attack)),
-        batch_size=cfg["mlp_batch_size"], shuffle=False
-    )
-    with torch.no_grad():
-        for (xb,) in loader:
-            scores.append(meta_clf(xb.to(device)).cpu().numpy())
-    scores = np.concatenate(scores)
+    # single-feature baseline: mean loss at each t (lower = member)
+    summary["raw_mean_loss_auc"] = {
+        f"{kind}_t{t}": float(roc_auc_score(y_member, -F[:, i, j, -1, 0]))
+        for i, t in enumerate(T_GRID) for j, kind in enumerate(("gauss", "cat"))}
+    with open(os.path.join(cfg["output_dir"], "result.json"), "w") as f:
+        json.dump(summary, f, indent=1)
 
-    # save outputs
+    # save outputs (largest K)
     np.save(os.path.join(cfg["output_dir"], "inference_scores.npy"), scores)
     print(f"\n  member scores     mean={scores[y_member==1].mean():.3f}  "
           f"std={scores[y_member==1].std():.3f}")
     print(f"  non-member scores mean={scores[y_member==0].mean():.3f}  "
           f"std={scores[y_member==0].std():.3f}")
 
-    # evaluate
-    print("\n[eval] Evaluating ...")
-    results = evaluate(scores, y_member)
-
-    # plots
+    # plots (largest K)
     print("\n[plots] Saving ...")
-    plot_roc(results, cfg["output_dir"])
+    plot_roc(res, cfg["output_dir"])
     plot_score_distributions(scores, y_member, cfg["output_dir"])
 
     print(f"\n[Block 4 done]  All outputs in ./{cfg['output_dir']}/")

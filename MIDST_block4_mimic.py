@@ -26,10 +26,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
 
-from midst_common import (DATASETS, parse_cli, preprocess, load_attack_pool,
-                          cat_idx, minmax, normalize, build_inner_model,
-                          build_diffusion,
-                          train_diffusion_steps, get_loss_vector,
+from midst_common import (DATASETS, PROBE, parse_cli, load_attack_pool,
+                          cat_idx, minmax, normalize, train_probe,
+                          get_loss_vector,
                           MetaClassifierMLP)
 
 
@@ -47,17 +46,11 @@ CONFIG = {
     "mlp_dropout":    0.3,
     "mlp_batch_size": 512,
 
-    # Proxy generator trained on released Dsynth
-    # Use same steps as base shadow (Block 1) for consistent quality
-    "proxy_num_steps":  600000,
-    "proxy_batch_size": 32,
-    "proxy_grad_accum": 2,
-    "proxy_lr":         8e-5,
-    "proxy_wd":         0.0,
-    "ema_decay":        0.995,
-    "ema_update_every": 10,
+    # Proxy generator trained on released Dsynth: midst_common.PROBE, the
+    # same overfitting settings as the synth-shadows (Block 2)
 
-    "n_loss_samples": 20,
+    "n_loss_samples":  20,
+    "loss_batch_size": 32,
 
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
@@ -72,18 +65,13 @@ def load_all_data(cfg):
     Load the attacked pool and its ground truth (Block 0) and the target's
     released synthetic data Dsynth (Block 0, raw units).
     """
-    ds       = cfg[cfg["dataset"]]
-    cat_cols = ds["diffusion_kwargs"]["categorical_features_indices"]
-
     X_pool, y_member = load_attack_pool(cfg)
-    X_real = torch.tensor(normalize(X_pool, *minmax(X_pool), cat_idx(cfg)))
+    pool_mn, pool_mx = minmax(X_pool)
+    X_real = torch.tensor(normalize(X_pool, pool_mn, pool_mx, cat_idx(cfg)))
 
-    X_syn = torch.from_numpy(np.load(os.path.join(cfg["output_dir"], "released.npy")))
+    X_syn = np.load(os.path.join(cfg["output_dir"], "released.npy"))
     print(f"  Dsynth (released) {tuple(X_syn.shape)}")
-    print(f"  Preprocessing Dsynth ...")
-    X_syn = preprocess(X_syn, cat_cols)
-
-    return X_real, y_member, X_syn
+    return X_real, y_member, X_syn, (pool_mn, pool_mx)
 
 
 # =============================================================================
@@ -154,7 +142,7 @@ def main():
 
     # load data
     print("\n[load] Loading data ...")
-    X_real, y_member, X_syn_released = load_all_data(cfg)
+    X_real, y_member, X_syn_raw, (pool_mn, pool_mx) = load_all_data(cfg)
 
     # load meta-classifier saved by Block 3
     clf_path = os.path.join(cfg["output_dir"], "meta_classifier.pt")
@@ -172,30 +160,23 @@ def main():
     # train proxy generator on released Dsynth
     # proxy substitutes for the unobserved target model weights
     print(f"\n[Block 4] Training proxy on Dsynth "
-          f"({cfg['proxy_num_steps']} steps) ...")
-    proxy = build_diffusion(cfg, build_inner_model(cfg))
-    proxy = train_diffusion_steps(
-        proxy, X_syn_released,
-        num_steps  = cfg["proxy_num_steps"],
-        batch_size = cfg["proxy_batch_size"],
-        grad_accum = cfg["proxy_grad_accum"],
-        lr         = cfg["proxy_lr"],
-        wd         = cfg["proxy_wd"],
-        cfg        = cfg,
-        desc       = "  proxy",
-    )
+          f"(hidden {PROBE['hidden']}, {PROBE['num_steps']} steps) ...")
+    proxy = train_probe(cfg, X_syn_raw, pool_mn, pool_mx, 900, "proxy")
+    torch.save(proxy.state_dict(), os.path.join(cfg["output_dir"], "proxy.pt"))
+    X_syn_released = torch.tensor(np.clip(normalize(X_syn_raw, pool_mn, pool_mx,
+                                                     cat_idx(cfg)), 0, 1))
 
     # compute relative losses on Dreal
     # baseline = mean proxy loss on Dsynth (matches shadow pipeline convention
     # where baseline = mean loss on Dk_syn)
     print("\n[Block 4] Extracting proxy loss features ...")
     proxy_baseline = get_loss_vector(
-        proxy, X_syn_released, cfg, batch_size=cfg["proxy_batch_size"]
+        proxy, X_syn_released, cfg, batch_size=cfg["loss_batch_size"]
     ).mean()
     print(f"  proxy baseline (mean loss on Dsynth): {proxy_baseline:.4f}")
 
     proxy_losses = get_loss_vector(
-        proxy, X_real, cfg, batch_size=cfg["proxy_batch_size"]
+        proxy, X_real, cfg, batch_size=cfg["loss_batch_size"]
     ) - proxy_baseline                                     # (N_real,)
     del proxy
 

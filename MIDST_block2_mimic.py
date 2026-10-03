@@ -2,7 +2,8 @@
 MIDST MIA -- Block 2: Train Synth-Shadow Models & Extract Losses
 ================================================================
 Reads outputs from Block 1 (Dk_syn + split indices) and for each k:
-  1. Trains a synth-shadow model on Dk_syn
+  1. Trains a synth-shadow model on Dk_syn (an overfitting probe:
+     midst_common.PROBE, data on the pool's min/max scale)
   2. Computes relative loss on ALL of Dreal:
        relative_loss(x) = mean_loss(x) - mean_loss(Dk_syn)
   3. Accumulates loss_matrix (N, K) and label_matrix (N, K)
@@ -18,9 +19,8 @@ import os
 import numpy as np
 import torch
 
-from midst_common import (DATASETS, parse_cli, load_attack_pool, cat_idx,
-                          minmax, normalize, preprocess, build_inner_model,
-                          build_diffusion, train_diffusion_steps,
+from midst_common import (DATASETS, PROBE, parse_cli, load_attack_pool,
+                          cat_idx, minmax, normalize, train_probe,
                           get_loss_vector)
 
 
@@ -35,15 +35,11 @@ CONFIG = {
 
     "K":                 32,    # must match Block 1
 
-    # Synth-shadow training
-    "shadow_num_steps":  600000,
-    "shadow_batch_size": 32,
-    "shadow_grad_accum": 2,
-    "shadow_lr":         8e-5,
-    "shadow_wd":         0.0,
+    # Synth-shadows use midst_common.PROBE (hidden 256, 1.4M steps)
 
     # Loss extraction
     "n_loss_samples":    20,
+    "loss_batch_size":   32,
 
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
@@ -64,7 +60,8 @@ def main():
 
     print("\n[load] Loading real data ...")
     X_pool, _ = load_attack_pool(cfg)
-    X_real = torch.tensor(normalize(X_pool, *minmax(X_pool), cat_idx(cfg)))
+    pool_mn, pool_mx = minmax(X_pool)
+    X_real = torch.tensor(normalize(X_pool, pool_mn, pool_mx, cat_idx(cfg)))
     N      = len(X_real)
     K      = cfg["K"]
 
@@ -97,31 +94,24 @@ def main():
         label_matrix[train_idx, k - 1] = 1.0
 
         # load Dk_syn -- raw units, released like the target's Dsynth
-        Dk_syn = torch.from_numpy(np.load(synth_path))
-        Dk_syn = preprocess(Dk_syn, cat_idx(cfg))
+        Dk_syn_raw = np.load(synth_path)
         print(f"\n  [k={k}/{K}] Training synth-shadow on "
-              f"{len(Dk_syn)} synthetic samples  "
-              f"({cfg['shadow_num_steps']} steps) ...")
-
-        synth_shadow = build_diffusion(cfg, build_inner_model(cfg))
-        synth_shadow = train_diffusion_steps(
-            synth_shadow, Dk_syn,
-            num_steps  = cfg["shadow_num_steps"],
-            batch_size = cfg["shadow_batch_size"],
-            grad_accum = cfg["shadow_grad_accum"],
-            lr         = cfg["shadow_lr"],
-            wd         = cfg["shadow_wd"],
-            cfg        = cfg,
-            desc       = f"    synth-shadow k={k}",
-        )
+              f"{len(Dk_syn_raw)} synthetic samples  "
+              f"(hidden {PROBE['hidden']}, {PROBE['num_steps']} steps) ...")
+        synth_shadow = train_probe(cfg, Dk_syn_raw, pool_mn, pool_mx, 500 + k,
+                                   f"synthshadow{k}")
+        torch.save(synth_shadow.state_dict(), os.path.join(
+            cfg["output_dir"], "block1", "models", f"k{k:03d}_synthshadow.pt"))
+        Dk_syn = torch.tensor(np.clip(normalize(Dk_syn_raw, pool_mn, pool_mx,
+                                                cat_idx(cfg)), 0, 1))
 
         # relative loss: subtract mean loss on Dk_syn as per-split baseline
         # so all K splits are on a comparable scale for the MLP
         print(f"  [k={k}/{K}] Extracting loss features ...")
         baseline          = get_loss_vector(synth_shadow, Dk_syn,  cfg,
-                                            batch_size=cfg["shadow_batch_size"]).mean()
+                                            batch_size=cfg["loss_batch_size"]).mean()
         loss_matrix[:, k - 1] = get_loss_vector(synth_shadow, X_real, cfg,
-                                            batch_size=cfg["shadow_batch_size"]) - baseline
+                                            batch_size=cfg["loss_batch_size"]) - baseline
         del synth_shadow, Dk_syn
 
         # diagnostics

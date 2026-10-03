@@ -94,6 +94,14 @@ TARGET = {
 }
 SPLIT_SEED = 0              # members / non-members drawn from the pooled data
 
+# Synth-shadows (Block 2) and the proxy (Block 4) are probes: they should
+# memorise the synthetic data they see as closely as possible, so they get
+# 4x the target's capacity and 2x its steps (same lr, batch and EMA).
+PROBE = {
+    "hidden":    256,
+    "num_steps": 1400000,
+}
+
 
 def parse_cli(cfg):
     """Command-line overrides shared by all blocks."""
@@ -348,6 +356,17 @@ def fit_release(cfg, X_raw, num_steps, hidden, seed, desc, ckpt_path):
     np.savez(ckpt_path + ".minmax.npz", mn=mn, mx=mx)
     S = generate_synthetic(model, TARGET["n_release"], 2500, cfg["device"], seed=seed)
     return model, (mn, mx), denormalize(S.numpy(), mn, mx, cat)
+
+
+def train_probe(cfg, S_raw, pool_mn, pool_mx, seed, desc):
+    """
+    Synth-shadow / proxy: fit PROBE to raw-unit synthetic data S_raw.
+    The data is scaled with the attacked pool's min/max (the scale the real
+    records are scored in) and clipped to [0, 1], so the probe learns the
+    synthetic data on the same scale as the records it later scores.
+    """
+    S = np.clip(normalize(S_raw, pool_mn, pool_mx, cat_idx(cfg)), 0, 1)
+    return train_model(cfg, S, PROBE["num_steps"], PROBE["hidden"], seed, desc)
 
 
 # =============================================================================

@@ -47,7 +47,7 @@ CONFIG = {
 
     **DATASETS,
 
-    "K":                    32,      # number of shadow models (50/50 splits)
+    "K":                    64,      # number of shadow models (50/50 splits)
 
     # Base shadows use the target's recipe (midst_common.TARGET) and hidden
     # size (target_hidden), so Dk_syn is distributed like the real release.
@@ -84,7 +84,7 @@ def main():
     print(f"\n[Block 1] Generating K={K} internal synthetic datasets ...")
     print(f"  Outputs -> {cfg['output_dir']}/block1/\n")
 
-    for k in range(1, K + 1):
+    for k in cfg["shadows"]:
         split_train_path = os.path.join(split_dir, f"k{k:03d}_train_idx.npy")
         split_test_path  = os.path.join(split_dir, f"k{k:03d}_test_idx.npy")
         synth_path       = os.path.join(synth_dir, f"k{k:03d}_Dk_syn.npy")

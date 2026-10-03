@@ -34,7 +34,7 @@ CONFIG = {
 
     **DATASETS,
 
-    "K":                 32,    # must match Block 1
+    "K":                 64,    # must match Block 1
 
     # Synth-shadows use midst_common.PROBE (hidden 256, 1.4M steps)
 
@@ -65,7 +65,7 @@ def main():
 
     print(f"\n[Block 2] Training synth-shadow models and extracting losses ...")
 
-    for k in range(1, K + 1):
+    for k in cfg["shadows"]:
         synth_path = os.path.join(synth_dir, f"k{k:03d}_Dk_syn.npy")
         feat_path  = os.path.join(feat_dir, f"ss{k:02d}.npy")
 

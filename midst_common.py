@@ -112,8 +112,20 @@ def parse_cli(cfg):
     p.add_argument("--n_members", type=int, default=None,
                    help="target training-set size; the attacked pool is 2 x this "
                         "(default: half of all records)")
+    p.add_argument("--shadows", default=None,
+                   help="Blocks 1 and 2: only these shadows, e.g. 3 or 1-16 "
+                        "(default: all K), to spread the shadows over GPUs")
+    p.add_argument("--proxy_only", action="store_true",
+                   help="Block 4: only train the proxy and save its loss "
+                        "features, so it can run alongside the shadows")
     a, _ = p.parse_known_args()
-    cfg = dict(cfg, dataset=a.dataset, n_members=a.n_members)
+    cfg = dict(cfg, dataset=a.dataset, n_members=a.n_members,
+               proxy_only=a.proxy_only)
+    if a.shadows:
+        lo, hi = (a.shadows.split("-") * 2)[:2]
+        cfg["shadows"] = range(int(lo), int(hi) + 1)
+    elif "K" in cfg:
+        cfg["shadows"] = range(1, cfg["K"] + 1)
     cfg["output_dir"] = a.output_dir or f"block1_{a.dataset}"
     os.makedirs(cfg["output_dir"], exist_ok=True)
     return cfg

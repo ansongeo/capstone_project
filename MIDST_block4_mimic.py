@@ -147,20 +147,26 @@ def main():
     def classifiers(view):
         paths = glob.glob(os.path.join(cfg["output_dir"], f"meta_classifier_{view}_K*.joblib"))
         return sorted(paths, key=lambda p: int(p.split("_K")[-1].split(".")[0]))
-    assert classifiers("blackbox"), "No meta-classifiers -- run Block 3 first."
 
     # train proxy generator on released Dsynth
     # proxy substitutes for the unobserved target model weights
-    print(f"\n[Block 4] Training proxy on Dsynth "
-          f"(hidden {PROBE['hidden']}, {PROBE['num_steps']} steps) ...")
-    proxy = train_probe(cfg, X_syn_raw, pool_mn, pool_mx, 900, "proxy")
-    torch.save(proxy.state_dict(), os.path.join(cfg["output_dir"], "proxy.pt"))
-
-    print("\n[Block 4] Extracting proxy loss features ...")
     feat_path = os.path.join(features_dir(cfg), "proxy.npy")
-    F = loss_features(cfg, proxy, X_real)
-    np.save(feat_path, F)
-    del proxy
+    if os.path.exists(feat_path):
+        print(f"\n[Block 4] {feat_path} exists, reusing the proxy's loss features.")
+        F = np.load(feat_path)
+    else:
+        print(f"\n[Block 4] Training proxy on Dsynth "
+              f"(hidden {PROBE['hidden']}, {PROBE['num_steps']} steps) ...")
+        proxy = train_probe(cfg, X_syn_raw, pool_mn, pool_mx, 900, "proxy")
+        torch.save(proxy.state_dict(), os.path.join(cfg["output_dir"], "proxy.pt"))
+
+        print("\n[Block 4] Extracting proxy loss features ...")
+        F = loss_features(cfg, proxy, X_real)
+        np.save(feat_path, F)
+        del proxy
+    if cfg["proxy_only"]:
+        return
+    assert classifiers("blackbox"), "No meta-classifiers -- run Block 3 first."
 
     attack_features = {"blackbox": F,
                        "whitebox": np.load(os.path.join(features_dir(cfg), "target.npy"))}

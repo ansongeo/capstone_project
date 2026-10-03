@@ -18,7 +18,8 @@ import os
 import numpy as np
 import torch
 
-from midst_common import (DATASETS, load_real_pool, build_inner_model,
+from midst_common import (DATASETS, parse_cli, load_attack_pool, cat_idx,
+                          minmax, normalize, build_inner_model,
                           build_diffusion, train_diffusion_steps,
                           get_loss_vector)
 
@@ -51,7 +52,6 @@ CONFIG = {
     # resume -- set to k index (0-based) to resume mid-run
     "resume_from_k":     0,
 
-    "output_dir": "block1_mimic",
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
 
@@ -61,7 +61,7 @@ CONFIG = {
 # =============================================================================
 
 def main():
-    cfg       = CONFIG
+    cfg       = parse_cli(CONFIG)
     split_dir = os.path.join(cfg["output_dir"], "block1", "splits")
     synth_dir = os.path.join(cfg["output_dir"], "block1", "synth")
     os.makedirs(cfg["output_dir"], exist_ok=True)
@@ -70,7 +70,8 @@ def main():
           f"device={cfg['device']}")
 
     print("\n[load] Loading real data ...")
-    X_real, _ = load_real_pool(cfg)
+    X_pool, _ = load_attack_pool(cfg)
+    X_real = torch.tensor(normalize(X_pool, *minmax(X_pool), cat_idx(cfg)))
     N      = len(X_real)
     K      = cfg["K"]
 

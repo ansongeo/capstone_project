@@ -1,7 +1,7 @@
 """
 MIDST MIA -- Block 4: Inference & Evaluation
 =============================================
-Reads meta_classifier.pt from Block 3.
+Reads meta_classifier.pt from Block 3 and Dsynth from Block 0.
 Trains a proxy generator on released Dsynth, computes relative losses
 on all of Dreal, applies the meta-classifier, and evaluates AUC.
 
@@ -26,8 +26,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
 
-from midst_common import (DATASETS, preprocess, load_real_pool,
-                          load_npy_or_pt, build_inner_model, build_diffusion,
+from midst_common import (DATASETS, parse_cli, preprocess, load_attack_pool,
+                          cat_idx, minmax, normalize, build_inner_model,
+                          build_diffusion,
                           train_diffusion_steps, get_loss_vector,
                           MetaClassifierMLP)
 
@@ -58,7 +59,6 @@ CONFIG = {
 
     "n_loss_samples": 20,
 
-    "output_dir": "block1_mimic",
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
 
@@ -69,27 +69,16 @@ CONFIG = {
 
 def load_all_data(cfg):
     """
-    Load and preprocess Dreal and Dsynth.
-    y_member is loaded from Block 1's saved y_member.npy to ensure
-    consistency with the split indices used during shadow training.
+    Load the attacked pool and its ground truth (Block 0) and the target's
+    released synthetic data Dsynth (Block 0, raw units).
     """
     ds       = cfg[cfg["dataset"]]
-    seq_len  = ds["diffusion_kwargs"]["seq_length"]
     cat_cols = ds["diffusion_kwargs"]["categorical_features_indices"]
 
-    # load Dreal as single unlabelled pool -- same as Blocks 1 and 2
-    X_real, _ = load_real_pool(cfg)
+    X_pool, y_member = load_attack_pool(cfg)
+    X_real = torch.tensor(normalize(X_pool, *minmax(X_pool), cat_idx(cfg)))
 
-    # load ground truth labels saved by Block 1
-    y_member_path = os.path.join(cfg["output_dir"], "y_member.npy")
-    assert os.path.exists(y_member_path), \
-        f"Missing {y_member_path} -- run Block 1 first."
-    y_member = np.load(y_member_path)
-    print(f"  ground truth: {int(y_member.sum())} members / "
-          f"{int((1-y_member).sum())} non-members")
-
-    # load and preprocess released Dsynth
-    X_syn = load_npy_or_pt(ds["synthetic_path"], seq_len)
+    X_syn = torch.from_numpy(np.load(os.path.join(cfg["output_dir"], "released.npy")))
     print(f"  Dsynth (released) {tuple(X_syn.shape)}")
     print(f"  Preprocessing Dsynth ...")
     X_syn = preprocess(X_syn, cat_cols)
@@ -157,7 +146,7 @@ def plot_score_distributions(scores, y_member, output_dir):
 # =============================================================================
 
 def main():
-    cfg    = CONFIG
+    cfg    = parse_cli(CONFIG)
     device = cfg["device"]
     os.makedirs(cfg["output_dir"], exist_ok=True)
     print(f"[config]  dataset={cfg['dataset']}  device={device}  "

@@ -15,18 +15,20 @@ What this block does
     4. Save Dk_syn + split indices to disk.
 
 Outputs saved to output_dir/block1/
-  splits/k{k:03d}_train_idx.npy   -- indices of Dk_train in X_real
-  splits/k{k:03d}_test_idx.npy    -- indices of Dk_test  in X_real
+  splits/k{k:03d}_train_idx.npy   -- indices of Dk_train in the attacked pool
+  splits/k{k:03d}_test_idx.npy    -- indices of Dk_test  in the attacked pool
   synth/k{k:03d}_Dk_syn.pt        -- generated synthetic tensor (N_syn, C, T)
 
-Run next: MIDST_block2_extract_losses.py
+Run after: MIDST_block0_mimic.py
+Run next:  MIDST_block2_mimic.py
 """
 
 import os
 import numpy as np
 import torch
 
-from midst_common import (DATASETS, load_real_pool, build_inner_model,
+from midst_common import (DATASETS, parse_cli, load_attack_pool, cat_idx,
+                          minmax, normalize, build_inner_model,
                           build_diffusion, train_diffusion_steps,
                           generate_synthetic)
 
@@ -59,32 +61,8 @@ CONFIG = {
     # resume -- set to k index (0-based) to resume from a specific split
     "resume_from_k":        0,
 
-    "output_dir": "block1_mimic",  # where to save splits and synthetic datasets
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
-
-
-# =============================================================================
-# DATA LOADING
-# =============================================================================
-
-def load_real_data(cfg):
-    """
-    The attacker sees Dreal as a single unlabelled pool.
-    X_train and X_test are joined into X_real -- the attacker does NOT
-    know the original split. y_member is ground truth kept only for
-    final evaluation in Block 4, never used during the attack itself.
-    """
-    X_real, n_train = load_real_pool(cfg)
-
-    # y_member is ground truth: 1 = was in original Dtrain, 0 = was in Dtest
-    # saved here for use in Block 4 evaluation only
-    y_member = np.zeros(len(X_real))
-    y_member[:n_train] = 1
-    np.save(os.path.join(cfg["output_dir"], "y_member.npy"), y_member)
-    print(f"  ground truth: {int(y_member.sum())} members / "
-          f"{int((1-y_member).sum())} non-members")
-    return X_real, y_member
 
 
 # =============================================================================
@@ -92,7 +70,7 @@ def load_real_data(cfg):
 # =============================================================================
 
 def main():
-    cfg = CONFIG
+    cfg = parse_cli(CONFIG)
     split_dir = os.path.join(cfg["output_dir"], "block1", "splits")
     synth_dir = os.path.join(cfg["output_dir"], "block1", "synth")
     os.makedirs(split_dir, exist_ok=True)
@@ -105,8 +83,9 @@ def main():
           f"batch={cfg['base_batch_size']}  "
           f"grad_accum={cfg['base_grad_accum']}")
 
-    print("\n[load] Loading real data ...")
-    X_real, y_member = load_real_data(cfg)
+    print("\n[load] Loading the attacked pool (Block 0) ...")
+    X_pool, _ = load_attack_pool(cfg)
+    X_real = torch.tensor(normalize(X_pool, *minmax(X_pool), cat_idx(cfg)))
     N = len(X_real)
 
     K            = cfg["K"]
@@ -170,7 +149,7 @@ def main():
 
     print(f"\n[Block 1 done]  Splits and synthetic datasets saved to "
           f"{cfg['output_dir']}/block1/")
-    print("  Run next: MIDST_block2_extract_losses.py")
+    print("  Run next: MIDST_block2_mimic.py")
 
 
 if __name__ == "__main__":

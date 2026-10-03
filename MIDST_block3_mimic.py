@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from midst_common import MetaClassifierMLP
+from midst_common import DATASETS, parse_cli, MetaClassifierMLP
 
 
 # =============================================================================
@@ -43,7 +43,7 @@ CONFIG = {
     "mlp_dropout":    0.3,
     "mlp_patience":   50,   # early stopping: epochs without improvement
 
-    "output_dir": "block1_mimic",
+    "dataset":    "mimic",
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
 
@@ -168,7 +168,7 @@ def train_meta_classifier(features, labels, cfg):
 # =============================================================================
 
 def main():
-    cfg = CONFIG
+    cfg = parse_cli(dict(CONFIG, **DATASETS))
     os.makedirs(cfg["output_dir"], exist_ok=True)
     print(f"[config]  device={cfg['device']}  output_dir={cfg['output_dir']}")
 

@@ -170,14 +170,35 @@ def build_diffusion(cfg, inner_model):
 
 
 def train_diffusion_steps(diffusion, X, num_steps, batch_size, grad_accum,
-                          lr, wd, cfg, desc):
+                          lr, wd, cfg, desc, seed=0):
     """
     Train like ETDiff.train() (models/ETDiff/et_diff.py) and return the EMA model:
       - one step = one optimiser update over grad_accum micro-batches
         (ETDiff's 700k steps are optimiser steps, i.e. 1.4M micro-batches),
       - Adam betas (0.9, 0.99), grad-norm clip 1.0,
       - EMA(0.995) updated every 10 steps, used for everything downstream.
+    On a GPU this runs as one CUDA graph per step (midst_fast.py, ~5x faster,
+    same loss); train_diffusion_steps_reference is the plain PyTorch loop.
     """
+    if not str(cfg["device"]).startswith("cuda"):
+        return train_diffusion_steps_reference(diffusion, X, num_steps, batch_size,
+                                               grad_accum, lr, wd, cfg, desc)
+    from midst_fast import train_graphed
+    assert wd == 0, "the CUDA-graph trainer implements Adam without weight decay"
+    kw = cfg[cfg["dataset"]]["diffusion_kwargs"]
+    X = nan_to_zero(X).to(cfg["device"])
+    return train_graphed(diffusion, X, num_steps,
+                         kw["numerical_features_indices"],
+                         kw["categorical_features_indices"],
+                         batch=batch_size * grad_accum, lr=lr,
+                         ema_decay=cfg.get("ema_decay", 0.995),
+                         ema_every=cfg.get("ema_update_every", 10),
+                         seed=seed, log=desc.strip())
+
+
+def train_diffusion_steps_reference(diffusion, X, num_steps, batch_size, grad_accum,
+                          lr, wd, cfg, desc):
+    """Plain PyTorch version of train_diffusion_steps (same semantics, slower)."""
     device     = cfg["device"]
     diffusion  = diffusion.to(device).train()
     ema        = EMA(diffusion,

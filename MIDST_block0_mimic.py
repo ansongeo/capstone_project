@@ -14,6 +14,8 @@ What this block does
      Adam(0.9, 0.99), EMA 0.995; hidden 68 for MIMIC-IV, 256 for eICU),
      normalised with the members' own min/max like TimeSeriesDataset.
   3. Releases 20,000 synthetic records in raw units, like etdiff_train.py.
+  4. White-box view: the target's own loss features on the pool (same
+     features as Blocks 2 and 4), used only by the white-box attack.
 
 Drawing our own split, instead of using the designated train file, gives a
 balanced 50/50 evaluation and lets the training-set size be varied with
@@ -24,6 +26,7 @@ Outputs saved to output_dir/
   y_member.npy           -- ground truth over the pool (Block 4 evaluation only)
   target.pt (+ .minmax.npz)
   released.npy           -- the target's synthetic release (20000, C, T)
+  features/target.npy    -- the target's loss features on the pool (white-box)
 
 Run next: MIDST_block1_mimic.py
 """
@@ -32,7 +35,8 @@ import os
 import numpy as np
 
 from midst_common import (DATASETS, TARGET, parse_cli, load_real_data,
-                          member_split, fit_release)
+                          member_split, fit_release, cat_idx, normalize,
+                          loss_features, features_dir)
 
 
 CONFIG = {
@@ -60,10 +64,15 @@ def main():
     hidden = cfg[cfg["dataset"]]["target_hidden"]
     print(f"[Block 0] Training target (hidden {hidden}, "
           f"{TARGET['num_steps']} steps) ...")
-    _, _, released = fit_release(cfg, X[pool][y_member == 1], TARGET["num_steps"],
-                                 hidden, TARGET["seed"], "target",
-                                 os.path.join(out, "target.pt"))
+    target, (mn, mx), released = fit_release(
+        cfg, X[pool][y_member == 1], TARGET["num_steps"], hidden, TARGET["seed"],
+        "target", os.path.join(out, "target.pt"))
     np.save(os.path.join(out, "released.npy"), released)
+
+    # white-box view: the target scores the pool in its own normalisation
+    print("[Block 0] Extracting the target's loss features (white-box) ...")
+    np.save(os.path.join(features_dir(cfg), "target.npy"),
+            loss_features(cfg, target, normalize(X[pool], mn, mx, cat_idx(cfg))))
     print(f"[Block 0 done]  released {released.shape} -> {out}/released.npy")
     print("  Run next: MIDST_block1_mimic.py")
 

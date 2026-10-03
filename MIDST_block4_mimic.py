@@ -9,12 +9,15 @@ meta-classifier, and evaluates AUC.
 The proxy is trained on Dsynth (released by the defender) and substitutes
 for the unobserved target model weights.
 
+Also scores the white-box reference: the whitebox classifiers from Block 3
+applied to the target's own loss features (Block 0).
+
 Outputs saved to output_dir/
   features/proxy.npy         -- proxy loss features (N, n_t, 2, n_budgets, 7)
-  inference_scores.npy       -- membership scores per patient (N,), largest K
-  result.json                -- AUC and TPR at low FPR for every K
-  midst_roc.png
-  midst_scores.png
+  inference_scores_{view}.npy -- membership scores per patient (N,), largest K
+  result.json                 -- AUC and TPR at low FPR, per view and K
+  midst_roc_{view}.png
+  midst_scores_{view}.png
 
 Run after: MIDST_block3_mimic.py
 """
@@ -90,10 +93,10 @@ def evaluate(scores, y_member):
     return results
 
 
-def plot_roc(results, output_dir):
+def plot_roc(results, output_dir, view):
     plt.figure(figsize=(7, 6))
     plt.plot(results["fpr"], results["tpr"], lw=2,
-             label=f"MIDST MIA  AUC={results['auc']:.3f}")
+             label=f"MIDST MIA ({view})  AUC={results['auc']:.3f}")
     plt.plot([0, 1], [0, 1], "k--", lw=1, label="Random")
     plt.xlim([0, 1]); plt.ylim([0, 1])
     plt.xlabel("False Positive Rate")
@@ -101,12 +104,12 @@ def plot_roc(results, output_dir):
     plt.title("MIDST MIA -- Member vs Non-member ROC")
     plt.legend(loc="lower right")
     plt.tight_layout()
-    path = os.path.join(output_dir, "midst_roc.png")
+    path = os.path.join(output_dir, f"midst_roc_{view}.png")
     plt.savefig(path, dpi=150); plt.close()
     print(f"[plot] {path}")
 
 
-def plot_score_distributions(scores, y_member, output_dir):
+def plot_score_distributions(scores, y_member, output_dir, view):
     m  = scores[y_member == 1]
     nm = scores[y_member == 0]
     plt.figure(figsize=(7, 4))
@@ -115,10 +118,10 @@ def plot_score_distributions(scores, y_member, output_dir):
     plt.hist(nm, **kw, color="tomato",    label=f"Non-members n={len(nm)}")
     plt.xlabel("Meta-classifier score (P(member))")
     plt.ylabel("Density")
-    plt.title("MIDST MIA -- Score distributions")
+    plt.title(f"MIDST MIA ({view}) -- Score distributions")
     plt.legend()
     plt.tight_layout()
-    path = os.path.join(output_dir, "midst_scores.png")
+    path = os.path.join(output_dir, f"midst_scores_{view}.png")
     plt.savefig(path, dpi=150); plt.close()
     print(f"[plot] {path}")
 
@@ -138,9 +141,10 @@ def main():
     print("\n[load] Loading data ...")
     X_real, y_member, X_syn_raw, (pool_mn, pool_mx) = load_all_data(cfg)
 
-    clf_paths = sorted(glob.glob(os.path.join(cfg["output_dir"], "meta_classifier_K*.joblib")),
-                       key=lambda p: int(p.split("_K")[-1].split(".")[0]))
-    assert clf_paths, "No meta_classifier_K*.joblib -- run Block 3 first."
+    def classifiers(view):
+        paths = glob.glob(os.path.join(cfg["output_dir"], f"meta_classifier_{view}_K*.joblib"))
+        return sorted(paths, key=lambda p: int(p.split("_K")[-1].split(".")[0]))
+    assert classifiers("blackbox"), "No meta-classifiers -- run Block 3 first."
 
     # train proxy generator on released Dsynth
     # proxy substitutes for the unobserved target model weights
@@ -154,35 +158,37 @@ def main():
     F = loss_features(cfg, proxy, X_real)
     np.save(feat_path, F)
     del proxy
-    X_attack = flat_features(F)
 
-    # score with every meta-classifier from Block 3 (one per shadow count K)
+    attack_features = {"blackbox": F,
+                       "whitebox": np.load(os.path.join(features_dir(cfg), "target.npy"))}
     summary = {}
-    for p in clf_paths:
-        K = int(p.split("_K")[-1].split(".")[0])
-        scores = joblib.load(p).predict_proba(X_attack)[:, 1]
-        print(f"\n[eval] K={K} shadows")
-        res = evaluate(scores, y_member)
-        summary[K] = {k: v for k, v in res.items() if k not in ("fpr", "tpr")}
+    for view, FF in attack_features.items():
+        # score with every meta-classifier from Block 3 (one per shadow count K)
+        X_attack = flat_features(FF)
+        summary[view] = {}
+        for p in classifiers(view):
+            K = int(p.split("_K")[-1].split(".")[0])
+            scores = joblib.load(p).predict_proba(X_attack)[:, 1]
+            print(f"\n[eval] {view}  K={K} shadows")
+            res = evaluate(scores, y_member)
+            summary[view][K] = {k: v for k, v in res.items() if k not in ("fpr", "tpr")}
 
-    # single-feature baseline: mean loss at each t (lower = member)
-    summary["raw_mean_loss_auc"] = {
-        f"{kind}_t{t}": float(roc_auc_score(y_member, -F[:, i, j, -1, 0]))
-        for i, t in enumerate(T_GRID) for j, kind in enumerate(("gauss", "cat"))}
+        # single-feature baseline: mean loss at each t (lower = member)
+        summary[view]["raw_mean_loss_auc"] = {
+            f"{kind}_t{t}": float(roc_auc_score(y_member, -FF[:, i, j, -1, 0]))
+            for i, t in enumerate(T_GRID) for j, kind in enumerate(("gauss", "cat"))}
+
+        # save outputs and plots (largest K)
+        np.save(os.path.join(cfg["output_dir"], f"inference_scores_{view}.npy"), scores)
+        print(f"\n  member scores     mean={scores[y_member==1].mean():.3f}  "
+              f"std={scores[y_member==1].std():.3f}")
+        print(f"  non-member scores mean={scores[y_member==0].mean():.3f}  "
+              f"std={scores[y_member==0].std():.3f}")
+        plot_roc(res, cfg["output_dir"], view)
+        plot_score_distributions(scores, y_member, cfg["output_dir"], view)
+
     with open(os.path.join(cfg["output_dir"], "result.json"), "w") as f:
         json.dump(summary, f, indent=1)
-
-    # save outputs (largest K)
-    np.save(os.path.join(cfg["output_dir"], "inference_scores.npy"), scores)
-    print(f"\n  member scores     mean={scores[y_member==1].mean():.3f}  "
-          f"std={scores[y_member==1].std():.3f}")
-    print(f"  non-member scores mean={scores[y_member==0].mean():.3f}  "
-          f"std={scores[y_member==0].std():.3f}")
-
-    # plots (largest K)
-    print("\n[plots] Saving ...")
-    plot_roc(res, cfg["output_dir"])
-    plot_score_distributions(scores, y_member, cfg["output_dir"])
 
     print(f"\n[Block 4 done]  All outputs in ./{cfg['output_dir']}/")
 

@@ -9,10 +9,14 @@ gradient-boosted tree classifier (LightGBM) on every (patient, shadow) pair:
     output = membership probability
 
 One classifier is trained per shadow count in K_SWEEP (first K shadows), so
-Block 4 can show whether more shadows still help.
+Block 4 can show whether more shadows still help, and per view:
+  blackbox -- rows from the synth-shadows (Block 2); applied to the proxy
+  whitebox -- rows from the base shadows themselves (Block 1); applied to the
+              target's own losses (Block 0). An upper reference: it assumes
+              access to the target model, which the black-box attacker lacks.
 
 Outputs saved to output_dir/
-  meta_classifier_K{K}.joblib
+  meta_classifier_{blackbox,whitebox}_K{K}.joblib
 
 Run next: MIDST_block4_mimic.py
 """
@@ -44,14 +48,17 @@ CONFIG = {
 # DATASET BUILDING
 # =============================================================================
 
-def shadow_ids(cfg):
+VIEWS = {"blackbox": "ss", "whitebox": "sh"}   # feature-file prefix per view
+
+
+def shadow_ids(cfg, prefix):
     d = features_dir(cfg)
-    return sorted(int(f[2:4]) for f in os.listdir(d) if f.startswith("ss"))
+    return sorted(int(f[2:4]) for f in os.listdir(d) if f.startswith(prefix))
 
 
-def build_meta_dataset(cfg, ks):
+def build_meta_dataset(cfg, ks, prefix):
     """
-    Pool the (features, label) pairs of shadows ks from Block 2.
+    Pool the (features, label) pairs of shadows ks (files {prefix}{k}.npy).
 
     Returns
     -------
@@ -59,7 +66,7 @@ def build_meta_dataset(cfg, ks):
     labels   : (N*K,)    int
     """
     d = features_dir(cfg)
-    features = np.concatenate([flat_features(np.load(os.path.join(d, f"ss{k:02d}.npy")))
+    features = np.concatenate([flat_features(np.load(os.path.join(d, f"{prefix}{k:02d}.npy")))
                                for k in ks])
     labels   = np.concatenate([np.load(os.path.join(d, f"lab{k:02d}.npy")) for k in ks])
     print(f"  pooled dataset : {features.shape}  "
@@ -73,18 +80,20 @@ def build_meta_dataset(cfg, ks):
 
 def main():
     cfg = parse_cli(dict(CONFIG, **DATASETS))
-    ks  = shadow_ids(cfg)
-    print(f"[config]  output_dir={cfg['output_dir']}  shadows available={len(ks)}")
+    print(f"[config]  output_dir={cfg['output_dir']}")
 
-    for K in cfg["K_sweep"]:
-        if K > len(ks):
-            break
-        print(f"\n[Block 3] K={K}: building training data and fitting LightGBM ...")
-        meta_X, meta_y = build_meta_dataset(cfg, ks[:K])
-        clf = lgb.LGBMClassifier(**cfg["lgbm"]).fit(meta_X, meta_y)
-        save_path = os.path.join(cfg["output_dir"], f"meta_classifier_K{K}.joblib")
-        joblib.dump(clf, save_path)
-        print(f"  saved {save_path}")
+    for view, prefix in VIEWS.items():
+        ks = shadow_ids(cfg, prefix)
+        print(f"\n[Block 3] {view}: {len(ks)} shadows available")
+        for K in cfg["K_sweep"]:
+            if K > len(ks):
+                break
+            print(f"  {view} K={K}: building training data and fitting LightGBM ...")
+            meta_X, meta_y = build_meta_dataset(cfg, ks[:K], prefix)
+            clf = lgb.LGBMClassifier(**cfg["lgbm"]).fit(meta_X, meta_y)
+            save_path = os.path.join(cfg["output_dir"], f"meta_classifier_{view}_K{K}.joblib")
+            joblib.dump(clf, save_path)
+            print(f"  saved {save_path}")
 
     print("\n[Block 3 done]")
     print("  Run next: MIDST_block4_mimic.py")

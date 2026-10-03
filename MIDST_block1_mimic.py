@@ -8,8 +8,8 @@ What this block does
   For each k = 1..K:
     1. Sample a random 80/20 split of Dreal -> (Dk_train, Dk_test)
     2. Train a BASE SHADOW GENERATOR on Dk_train (real patients)
-       using full training (num_steps iterations with gradient accumulation
-       and EMA, matching the original ETDiff training setup) so that the
+       the way ETDiff.train() does (optimiser steps over accumulated
+       micro-batches, Adam betas (0.9, 0.99), EMA) so that the
        generated synthetic data is high quality.
     3. Generate Dk_syn from the base shadow.
     4. Save Dk_syn + split indices to disk.
@@ -153,7 +153,6 @@ def main():
             wd         = cfg["base_wd"],
             cfg        = cfg,
             desc       = f"    base shadow k={k+1}",
-            use_ema    = False,
         )
 
         # Step 1c: generate Dk_syn

@@ -170,50 +170,49 @@ def build_diffusion(cfg, inner_model):
 
 
 def train_diffusion_steps(diffusion, X, num_steps, batch_size, grad_accum,
-                          lr, wd, cfg, desc, use_ema=True):
+                          lr, wd, cfg, desc):
     """
-    Train for a fixed number of gradient steps rather than epochs.
-    Returns the EMA model when use_ema, else the raw model.
+    Train like ETDiff.train() (models/ETDiff/et_diff.py) and return the EMA model:
+      - one step = one optimiser update over grad_accum micro-batches
+        (ETDiff's 700k steps are optimiser steps, i.e. 1.4M micro-batches),
+      - Adam betas (0.9, 0.99), grad-norm clip 1.0,
+      - EMA(0.995) updated every 10 steps, used for everything downstream.
     """
     device     = cfg["device"]
     diffusion  = diffusion.to(device).train()
-    if use_ema:
-        ema = EMA(diffusion,
-                  beta         = cfg.get("ema_decay", 0.995),
-                  update_every = cfg.get("ema_update_every", 10)).to(device)
+    ema        = EMA(diffusion,
+                     beta         = cfg.get("ema_decay", 0.995),
+                     update_every = cfg.get("ema_update_every", 10)).to(device)
 
-    optimizer  = torch.optim.Adam(diffusion.parameters(), lr=lr, weight_decay=wd)
+    optimizer  = torch.optim.Adam(diffusion.parameters(), lr=lr, weight_decay=wd,
+                                  betas=(0.9, 0.99))
     loader     = DataLoader(TensorDataset(X), batch_size=batch_size,
                             shuffle=True, drop_last=True)
     data_iter  = iter(loader)
     pbar       = tqdm(range(num_steps), desc=desc, leave=False)
-    accum_loss = 0.0
-    optimizer.zero_grad()
 
-    for step in pbar:
+    def next_batch():
+        nonlocal data_iter
         try:
             (xb,) = next(data_iter)
         except StopIteration:
             data_iter = iter(loader)
             (xb,) = next(data_iter)
+        return nan_to_zero(xb).to(device)
 
-        xb   = nan_to_zero(xb).to(device)
-        loss = diffusion(xb) / grad_accum
-        loss.backward()
-        accum_loss += loss.item()
+    for step in pbar:
+        accum_loss = 0.0
+        for _ in range(grad_accum):
+            loss = diffusion(next_batch()) / grad_accum
+            loss.backward()
+            accum_loss += loss.item()
+        nn.utils.clip_grad_norm_(diffusion.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        ema.update()
+        pbar.set_postfix(loss=f"{accum_loss:.4f}")
 
-        if (step + 1) % grad_accum == 0:
-            nn.utils.clip_grad_norm_(diffusion.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            if use_ema:
-                ema.update()
-            pbar.set_postfix(loss=f"{accum_loss:.4f}")
-            accum_loss = 0.0
-
-    if use_ema:
-        return ema.ema_model.cpu()
-    return diffusion.cpu()
+    return ema.ema_model.cpu()
 
 
 # =============================================================================

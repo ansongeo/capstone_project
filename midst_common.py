@@ -62,6 +62,24 @@ DATASETS = {
             "parametrization":              "x0",
         },
     },
+
+    "physionet": {   # public stand-in, MIMIC-IV layout: preprocess/physionet2012.py
+        "train_path":     "data/physionet2012/TRAIN-physionet2012_48h.pt",
+        "test_path":      "data/physionet2012/TEST-physionet2012_48h.pt",
+        "target_hidden":  68,    # same layout as MIMIC-IV
+        "diffusion_kwargs": {
+            "seq_length":                   48,
+            "channels":                     11,
+            "numerical_features_indices":   [0, 2, 4, 6, 8],
+            "categorical_features_indices": [1, 3, 5, 7, 9, 10],
+            "categorical_num_classes":      [2, 2, 2, 2, 2, 2],
+            "timesteps":                    1000,
+            "beta_schedule":                "cosine",
+            "auto_normalize":               True,
+            "loss_lambda":                  0.8,
+            "parametrization":              "x0",
+        },
+    },
 }
 
 

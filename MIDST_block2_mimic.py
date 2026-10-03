@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from midst_common import (DATASETS, parse_cli, load_attack_pool, cat_idx,
-                          minmax, normalize, build_inner_model,
+                          minmax, normalize, preprocess, build_inner_model,
                           build_diffusion, train_diffusion_steps,
                           get_loss_vector)
 
@@ -33,11 +33,11 @@ CONFIG = {
 
     **DATASETS,
 
-    "K":                 16,
+    "K":                 32,
     "split_train_frac":  0.5,   # must match Block 1
 
     # Synth-shadow training
-    "shadow_num_steps":  600000,  # Dk_syn is 2000 samples so converges faster
+    "shadow_num_steps":  600000,
     "shadow_batch_size": 32,
     "shadow_grad_accum": 2,
     "shadow_lr":         8e-5,
@@ -48,9 +48,6 @@ CONFIG = {
 
     # must match Block 1
     "split_seed":        42,
-
-    # resume -- set to k index (0-based) to resume mid-run
-    "resume_from_k":     0,
 
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
@@ -87,30 +84,26 @@ def main():
         loss_matrix  = np.zeros((N, K), dtype=np.float32)
         label_matrix = np.zeros((N, K), dtype=np.float32)
 
-    resume_from = cfg["resume_from_k"]
     print(f"\n[Block 2] Training synth-shadow models and extracting losses ...")
 
-    for k in range(K):
-        if k < resume_from:
-            print(f"  [k={k+1}/{K}] Skipping (resume_from_k={resume_from})")
-            continue
-
-        synth_path     = os.path.join(synth_dir, f"k{k:03d}_Dk_syn.pt")
+    for k in range(1, K + 1):
+        synth_path     = os.path.join(synth_dir, f"k{k:03d}_Dk_syn.npy")
         train_idx_path = os.path.join(split_dir,  f"k{k:03d}_train_idx.npy")
         test_idx_path  = os.path.join(split_dir,  f"k{k:03d}_test_idx.npy")
 
         if not os.path.exists(synth_path):
-            print(f"  [k={k+1}/{K}] Missing {synth_path} -- run Block 1 first.")
+            print(f"  [k={k}/{K}] Missing {synth_path} -- run Block 1 first.")
             continue
 
         # load split indices
         train_idx = np.load(train_idx_path)
         test_idx  = np.load(test_idx_path)
-        label_matrix[train_idx, k] = 1.0
+        label_matrix[train_idx, k - 1] = 1.0
 
-        # load Dk_syn -- already in model output space, no preprocessing needed
-        Dk_syn = torch.load(synth_path, map_location="cpu").float()
-        print(f"\n  [k={k+1}/{K}] Training synth-shadow on "
+        # load Dk_syn -- raw units, released like the target's Dsynth
+        Dk_syn = torch.from_numpy(np.load(synth_path))
+        Dk_syn = preprocess(Dk_syn, cat_idx(cfg))
+        print(f"\n  [k={k}/{K}] Training synth-shadow on "
               f"{len(Dk_syn)} synthetic samples  "
               f"({cfg['shadow_num_steps']} steps) ...")
 
@@ -123,28 +116,28 @@ def main():
             lr         = cfg["shadow_lr"],
             wd         = cfg["shadow_wd"],
             cfg        = cfg,
-            desc       = f"    synth-shadow k={k+1}",
+            desc       = f"    synth-shadow k={k}",
         )
 
         # relative loss: subtract mean loss on Dk_syn as per-split baseline
         # so all K splits are on a comparable scale for the MLP
-        print(f"  [k={k+1}/{K}] Extracting loss features ...")
+        print(f"  [k={k}/{K}] Extracting loss features ...")
         baseline          = get_loss_vector(synth_shadow, Dk_syn,  cfg,
                                             batch_size=cfg["shadow_batch_size"]).mean()
-        loss_matrix[:, k] = get_loss_vector(synth_shadow, X_real, cfg,
+        loss_matrix[:, k - 1] = get_loss_vector(synth_shadow, X_real, cfg,
                                             batch_size=cfg["shadow_batch_size"]) - baseline
         del synth_shadow, Dk_syn
 
         # diagnostics
-        m_loss  = loss_matrix[train_idx, k].mean()
-        nm_loss = loss_matrix[test_idx,  k].mean()
-        print(f"  [k={k+1}/{K}] member rel_loss={m_loss:.4f}  "
+        m_loss  = loss_matrix[train_idx, k - 1].mean()
+        nm_loss = loss_matrix[test_idx,  k - 1].mean()
+        print(f"  [k={k}/{K}] member rel_loss={m_loss:.4f}  "
               f"non-member rel_loss={nm_loss:.4f}  gap={nm_loss-m_loss:.4f}")
 
         # checkpoint after every split so progress isn't lost on VM timeout
         np.save(loss_path,  loss_matrix)
         np.save(label_path, label_matrix)
-        print(f"  [k={k+1}/{K}] Checkpointed -> {loss_path}")
+        print(f"  [k={k}/{K}] Checkpointed -> {loss_path}")
 
     print(f"\n[Block 2 done]")
     print(f"  loss_matrix  : {loss_matrix.shape}")

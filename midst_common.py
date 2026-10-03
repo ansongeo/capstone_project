@@ -501,8 +501,17 @@ def loss_features(cfg, diffusion, Xn, rows=4096):
 
 
 def flat_features(F):
-    """(n, nT, 2, nB, 7) -> (n, d): every summary at the largest draw budget."""
-    return F[:, :, :, -1].reshape(len(F), -1)
+    """
+    Classifier input from loss features (n, nT, 2, nB, 7) -> (n, d):
+      - log |summary| for all 7 summaries, per t and loss type, at the
+        largest draw budget (losses span orders of magnitude across t),
+      - the change of the mean loss from one t to the next (how fast the
+        loss grows with noise level, per loss type).
+    """
+    f = F[:, :, :, -1]                                  # (n, nT, 2, 7)
+    slope = np.diff(f[..., 0], axis=1)                  # (n, nT-1, 2)
+    return np.concatenate([np.log(np.abs(f) + 1e-8).reshape(len(F), -1),
+                           slope.reshape(len(F), -1)], 1).astype(np.float32)
 
 
 def features_dir(cfg):

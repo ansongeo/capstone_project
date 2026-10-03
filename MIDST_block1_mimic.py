@@ -25,12 +25,10 @@ Run next: MIDST_block2_extract_losses.py
 import os
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
 
-from models.ETDiff.mixed_diffusion import MixedDiffusion
-from models.ETDiff.blocks import RNN
+from midst_common import (DATASETS, load_real_pool, build_inner_model,
+                          build_diffusion, train_diffusion_steps,
+                          generate_synthetic)
 
 
 # =============================================================================
@@ -40,41 +38,7 @@ from models.ETDiff.blocks import RNN
 CONFIG = {
     "dataset": "mimic",    # "eicu" | "mimic"
 
-    "eicu": {
-        "train_path":     "data/eicu-extract/TRAIN-eicu_multiple_60_1440_276.pt",
-        "test_path":      "data/eicu-extract/TEST-eicu_multiple_60_1440_276.pt",
-        "synthetic_path": "samples/eicu.npy",
-        "diffusion_kwargs": {
-            "seq_length":                   272,
-            "channels":                     9,
-            "numerical_features_indices":   [0, 2, 4, 6],
-            "categorical_features_indices": [1, 3, 5, 7, 8],
-            "categorical_num_classes":      [2, 2, 2, 2, 2],
-            "timesteps":                    1000,
-            "beta_schedule":                "cosine",
-            "auto_normalize":               True,
-            "loss_lambda":                  0.8,
-            "parametrization":              "x0",
-        },
-    },
-
-    "mimic": {
-        "train_path":     "data/mimic4-extract/TRAIN-mimic4_vitals_72h.pt",
-        "test_path":      "data/mimic4-extract/TEST-mimic4_vitals_72h.pt",
-        "synthetic_path": "samples/mimiciv.npy",
-        "diffusion_kwargs": {
-            "seq_length":                   72,
-            "channels":                     11,
-            "numerical_features_indices":   [0, 2, 4, 6, 8],
-            "categorical_features_indices": [1, 3, 5, 7, 9, 10],
-            "categorical_num_classes":      [2, 2, 2, 2, 2, 2],
-            "timesteps":                    1000,
-            "beta_schedule":                "cosine",
-            "auto_normalize":               True,
-            "loss_lambda":                  0.8,
-            "parametrization":              "x0",
-        },
-    },
+    **DATASETS,
 
     "K":                    16,      # number of 80/20 splits
     "split_train_frac":     0.8,     # 80% train / 20% test
@@ -111,209 +75,16 @@ def load_real_data(cfg):
     know the original split. y_member is ground truth kept only for
     final evaluation in Block 4, never used during the attack itself.
     """
-    ds      = cfg[cfg["dataset"]]
-    seq_len = ds["diffusion_kwargs"]["seq_length"]
-    X_train = torch.load(ds["train_path"], map_location="cpu").float()
-    X_test  = torch.load(ds["test_path"],  map_location="cpu").float()
-    X_train = X_train[:, :, :seq_len]
-    X_test  = X_test[:,  :, :seq_len]
-
-    # join into single unlabelled pool -- this is all the attacker sees
-    X_real = torch.cat([X_train, X_test], dim=0)
-
-    # preprocess to match ETDiff training pipeline:
-    #   1. replace NaNs with per-channel mean
-    #   2. min-max normalize to [0,1], categorical columns left untouched
-    ds_cfg         = cfg[cfg["dataset"]]
-    categorical_cols = ds_cfg["diffusion_kwargs"]["categorical_features_indices"]
-    print(f"  Preprocessing: replace NaN with mean + min-max normalize ...")
-    X_real = preprocess(X_real, categorical_cols)
+    X_real, n_train = load_real_pool(cfg)
 
     # y_member is ground truth: 1 = was in original Dtrain, 0 = was in Dtest
     # saved here for use in Block 4 evaluation only
-    y_member = torch.cat([torch.ones(len(X_train)),
-                          torch.zeros(len(X_test))]).numpy()
+    y_member = np.zeros(len(X_real))
+    y_member[:n_train] = 1
     np.save(os.path.join(cfg["output_dir"], "y_member.npy"), y_member)
-
-    print(f"  X_train {tuple(X_train.shape)}  X_test {tuple(X_test.shape)}")
-    print(f"  Dreal (joined pool) {tuple(X_real.shape)}")
     print(f"  ground truth: {int(y_member.sum())} members / "
           f"{int((1-y_member).sum())} non-members")
     return X_real, y_member
-
-
-def replace_nan_with_mean(data: torch.Tensor) -> torch.Tensor:
-    """Replace NaNs with per-channel mean -- matches ETDiff training."""
-    mean = data.nanmean(dim=(0, 2))[None, :, None]
-    data = torch.where(torch.isnan(data), mean, data)
-    return data
-
-
-def normalize_data(data: torch.Tensor, categorical_cols: list,
-                   eps: float = 0) -> torch.Tensor:
-    """
-    Min-max normalize to [0,1] along (samples, time) per channel.
-    Categorical columns are left untouched -- matches ETDiff training.
-    """
-    data_np = data.numpy()
-
-    if categorical_cols is not None:
-        indicators = data_np[:, categorical_cols, :].copy()
-
-    mn  = np.nanmin(data_np, axis=(0, 2))
-    mx  = np.nanmax(data_np, axis=(0, 2))
-    mn  = mn[None, :, None]
-    mx  = mx[None, :, None]
-    data_np = (data_np - mn + eps) / (mx - mn + 2 * eps)
-
-    if categorical_cols is not None:
-        data_np[:, categorical_cols, :] = indicators   # restore categoricals
-
-    return torch.tensor(data_np).float()
-
-
-def preprocess(data: torch.Tensor, categorical_cols: list) -> torch.Tensor:
-    """Full preprocessing pipeline matching ETDiff TimeSeriesDataset."""
-    data = replace_nan_with_mean(data)
-    data = normalize_data(data, categorical_cols)
-    return data
-
-
-def nan_to_zero(x):
-    """Fallback for in-loop NaN cleanup after preprocessing."""
-    return torch.nan_to_num(x, nan=0.0)
-
-
-# =============================================================================
-# MODEL CONSTRUCTION
-# =============================================================================
-
-def build_inner_model(cfg):
-    ds_cfg  = cfg[cfg["dataset"]]
-    diff_kw = ds_cfg["diffusion_kwargs"]
-    n_num   = len(diff_kw["numerical_features_indices"])
-    n_cat   = sum(diff_kw["categorical_num_classes"])
-    ch      = n_num + n_cat
-    return RNN(
-        input_channels  = ch,
-        hidden_channels = 256,
-        output_channels = ch,
-        layers          = 3,
-        model           = "lstm",
-        dropout         = 0,
-        bidirectional   = False,
-        self_condition  = False,
-        embed_dim       = 64,
-        time_dim        = 256,
-    )
-
-
-def build_diffusion(cfg, inner_model):
-    ds_cfg = cfg[cfg["dataset"]]
-    return MixedDiffusion(model=inner_model, **ds_cfg["diffusion_kwargs"])
-
-
-def train_diffusion_steps(diffusion, X, num_steps, batch_size, grad_accum,
-                          lr, wd, cfg, desc):
-    """
-    Train for a fixed number of gradient steps rather than epochs.
-    Matches the ETDiff training setup (num_steps + gradient accumulation).
-    """
-    device    = cfg["device"]
-    diffusion = diffusion.to(device).train()
-    optimizer = torch.optim.Adam(diffusion.parameters(), lr=lr, weight_decay=wd)
-    loader    = DataLoader(TensorDataset(X), batch_size=batch_size,
-                           shuffle=True, drop_last=True)
-    data_iter = iter(loader)
-    pbar      = tqdm(range(num_steps), desc=desc, leave=False)
-
-    step        = 0
-    accum_loss  = 0.0
-    optimizer.zero_grad()
-
-    for step in pbar:
-        try:
-            (xb,) = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            (xb,) = next(data_iter)
-
-        xb   = nan_to_zero(xb).to(device)
-        loss = diffusion(xb) / grad_accum
-        loss.backward()
-        accum_loss += loss.item()
-
-        if (step + 1) % grad_accum == 0:
-            nn.utils.clip_grad_norm_(diffusion.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            pbar.set_postfix(loss=f"{accum_loss:.4f}")
-            accum_loss = 0.0
-
-    return diffusion.cpu()
-
-
-# =============================================================================
-# SYNTHETIC DATA GENERATION
-# =============================================================================
-
-@torch.no_grad()
-def generate_synthetic(diffusion, n_samples, batch_size, device):
-    from models.ETDiff.mixed_diffusion import ohe_to_categories
-
-    diffusion = diffusion.to(device).eval()
-    num_idx  = diffusion.numerical_features_indices
-    cat_idx  = diffusion.categorical_features_indices
-    channels = diffusion.channels
-    seq_len  = diffusion.seq_length
-    samples, remaining = [], n_samples
-
-    while remaining > 0:
-        b = min(batch_size, remaining)
-        z_norm = torch.randn(
-            (b, diffusion.num_numerical_features, seq_len), device=device
-        )
-        has_cat = (len(diffusion.categorical_num_classes) > 0 and
-                   diffusion.categorical_num_classes[0] != 0)
-        log_z = torch.zeros((b, 0, seq_len), device=device).float()
-        if has_cat:
-            uniform_logits = torch.zeros(
-                (b, len(diffusion.categorical_num_classes_expanded), seq_len),
-                device=device
-            )
-            log_z = diffusion.cat_log_sample_categorical(uniform_logits)
-
-        for i in reversed(range(diffusion.num_timesteps)):
-            t = torch.full((b,), i, device=device, dtype=torch.long)
-            x = torch.cat([z_norm, log_z], dim=1).float()
-            model_out     = diffusion.model(x, t, None)
-            model_out_num = diffusion.extract_modeloutput(model_out, "numerical")
-            model_out_cat = diffusion.extract_modeloutput(model_out, "categorical")
-            z_norm, _     = diffusion.gauss_p_sample(
-                model_out_num, z_norm, t, i, clip_denoised=True
-            )
-            if has_cat:
-                log_z = diffusion.cat_p_sample(model_out_cat, log_z, t, None)
-
-        z_norm = diffusion.unnormalize(z_norm)
-        if has_cat:
-            z_cat = ohe_to_categories(
-                torch.exp(log_z).round(),
-                diffusion.categorical_num_classes
-            ).cpu().float()
-        else:
-            z_cat = torch.zeros((b, 0, seq_len))
-
-        out = torch.zeros((b, channels, seq_len))
-        out[:, num_idx, :] = z_norm.cpu()
-        if len(cat_idx) > 0:
-            out[:, cat_idx, :] = z_cat
-
-        samples.append(out)
-        remaining -= b
-
-    diffusion.cpu()
-    return torch.cat(samples, dim=0)
 
 
 # =============================================================================
@@ -382,6 +153,7 @@ def main():
             wd         = cfg["base_wd"],
             cfg        = cfg,
             desc       = f"    base shadow k={k+1}",
+            use_ema    = False,
         )
 
         # Step 1c: generate Dk_syn

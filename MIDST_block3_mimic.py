@@ -27,6 +27,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
+from midst_common import MetaClassifierMLP
+
 
 # =============================================================================
 # CONFIG -- output_dir must match Block 2
@@ -44,32 +46,6 @@ CONFIG = {
     "output_dir": "block1_mimic",
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
-
-
-# =============================================================================
-# META-CLASSIFIER
-# =============================================================================
-
-class MetaClassifierMLP(nn.Module):
-    """
-    Input : (batch, 1)  -- scalar relative loss per (patient, shadow) pair
-    Output: (batch,)    -- raw logit for P(member)
-
-    Learns: lower relative loss -> more likely member
-    (model was trained on members -> assigns lower loss to them)
-    """
-    def __init__(self, input_dim, hidden_sizes, dropout):
-        super().__init__()
-        layers = []
-        prev   = input_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
-            prev = h
-        layers.append(nn.Linear(prev, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
 
 
 # =============================================================================

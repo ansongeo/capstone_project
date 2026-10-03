@@ -2,21 +2,20 @@
 MIDST MIA -- Block 4: Inference & Evaluation
 =============================================
 Reads meta_classifier.pt from Block 3 and Dsynth from Block 0.
-Trains a proxy generator on released Dsynth, computes relative losses
-on all of Dreal, applies the meta-classifier, and evaluates AUC.
-
-  relative_loss(x) = mean_loss_proxy(x) - mean_loss_proxy(Dsynth)
+Trains a proxy generator on released Dsynth, computes the same loss
+features as Block 2 on all of the attacked pool, applies the
+meta-classifier, and evaluates AUC.
 
 The proxy is trained on Dsynth (released by the defender) and substitutes
 for the unobserved target model weights.
 
 Outputs saved to output_dir/
+  features/proxy.npy         -- proxy loss features (N, n_t, 2, n_budgets, 7)
   inference_scores.npy       -- MLP logit scores per patient (N,)
-  proxy_losses.npy           -- relative proxy loss per patient (N,)
   midst_roc.png
   midst_scores.png
 
-Run after: MIDST_block3_train_classifier.py
+Run after: MIDST_block3_mimic.py
 """
 
 import os
@@ -28,7 +27,7 @@ import matplotlib.pyplot as plt
 
 from midst_common import (DATASETS, PROBE, parse_cli, load_attack_pool,
                           cat_idx, minmax, normalize, train_probe,
-                          get_loss_vector,
+                          loss_features, flat_features, features_dir,
                           MetaClassifierMLP)
 
 
@@ -49,9 +48,6 @@ CONFIG = {
     # Proxy generator trained on released Dsynth: midst_common.PROBE, the
     # same overfitting settings as the synth-shadows (Block 2)
 
-    "n_loss_samples":  20,
-    "loss_batch_size": 32,
-
     "device":     "cuda" if torch.cuda.is_available() else "cpu",
 }
 
@@ -67,7 +63,7 @@ def load_all_data(cfg):
     """
     X_pool, y_member = load_attack_pool(cfg)
     pool_mn, pool_mx = minmax(X_pool)
-    X_real = torch.tensor(normalize(X_pool, pool_mn, pool_mx, cat_idx(cfg)))
+    X_real = normalize(X_pool, pool_mn, pool_mx, cat_idx(cfg))
 
     X_syn = np.load(os.path.join(cfg["output_dir"], "released.npy"))
     print(f"  Dsynth (released) {tuple(X_syn.shape)}")
@@ -144,18 +140,9 @@ def main():
     print("\n[load] Loading data ...")
     X_real, y_member, X_syn_raw, (pool_mn, pool_mx) = load_all_data(cfg)
 
-    # load meta-classifier saved by Block 3
     clf_path = os.path.join(cfg["output_dir"], "meta_classifier.pt")
     assert os.path.exists(clf_path), \
         f"Missing {clf_path} -- run Block 3 first."
-    meta_clf = MetaClassifierMLP(
-        input_dim    = 1,
-        hidden_sizes = cfg["mlp_hidden"],
-        dropout      = cfg["mlp_dropout"],
-    )
-    meta_clf.load_state_dict(torch.load(clf_path, map_location="cpu"))
-    meta_clf.eval()
-    print(f"  Loaded meta-classifier from {clf_path}")
 
     # train proxy generator on released Dsynth
     # proxy substitutes for the unobserved target model weights
@@ -163,51 +150,29 @@ def main():
           f"(hidden {PROBE['hidden']}, {PROBE['num_steps']} steps) ...")
     proxy = train_probe(cfg, X_syn_raw, pool_mn, pool_mx, 900, "proxy")
     torch.save(proxy.state_dict(), os.path.join(cfg["output_dir"], "proxy.pt"))
-    X_syn_released = torch.tensor(np.clip(normalize(X_syn_raw, pool_mn, pool_mx,
-                                                     cat_idx(cfg)), 0, 1))
 
-    # compute relative losses on Dreal
-    # baseline = mean proxy loss on Dsynth (matches shadow pipeline convention
-    # where baseline = mean loss on Dk_syn)
     print("\n[Block 4] Extracting proxy loss features ...")
-    proxy_baseline = get_loss_vector(
-        proxy, X_syn_released, cfg, batch_size=cfg["loss_batch_size"]
-    ).mean()
-    print(f"  proxy baseline (mean loss on Dsynth): {proxy_baseline:.4f}")
-
-    proxy_losses = get_loss_vector(
-        proxy, X_real, cfg, batch_size=cfg["loss_batch_size"]
-    ) - proxy_baseline                                     # (N_real,)
+    feat_path = os.path.join(features_dir(cfg), "proxy.npy")
+    F = loss_features(cfg, proxy, X_real)
+    np.save(feat_path, F)
     del proxy
+    X_attack = flat_features(F)
 
-    print(f"  proxy_losses (raw)  mean={proxy_losses.mean():.4f}  "
-          f"std={proxy_losses.std():.4f}  "
-          f"min={proxy_losses.min():.4f}  max={proxy_losses.max():.4f}")
-
-    # clip proxy losses at the same p99 threshold used in Block 3
-    # so inference inputs match the training distribution seen by the MLP
-    loss_matrix_path = os.path.join(cfg["output_dir"], "loss_matrix.npy")
-    if os.path.exists(loss_matrix_path):
-        loss_matrix = np.load(loss_matrix_path)
-        p99_threshold = np.mean([
-            np.percentile(loss_matrix[:, k], 99)
-            for k in range(loss_matrix.shape[1])
-        ])
-        print(f"  Clipping at mean p99={p99_threshold:.3f} "
-              f"(from Block 2 loss_matrix)")
-        proxy_losses = np.clip(proxy_losses, -np.inf, p99_threshold)
-    else:
-        print(f"  WARNING: loss_matrix.npy not found -- skipping clip")
-
-    print(f"  proxy_losses (clipped)  mean={proxy_losses.mean():.4f}  "
-          f"std={proxy_losses.std():.4f}  "
-          f"min={proxy_losses.min():.4f}  max={proxy_losses.max():.4f}")
+    # load meta-classifier saved by Block 3
+    meta_clf = MetaClassifierMLP(
+        input_dim    = X_attack.shape[1],
+        hidden_sizes = cfg["mlp_hidden"],
+        dropout      = cfg["mlp_dropout"],
+    )
+    meta_clf.load_state_dict(torch.load(clf_path, map_location="cpu"))
+    meta_clf.eval()
+    print(f"  Loaded meta-classifier from {clf_path}")
 
     # score with meta-classifier
     meta_clf = meta_clf.to(device)
     scores   = []
     loader   = DataLoader(
-        TensorDataset(torch.from_numpy(proxy_losses.reshape(-1, 1))),
+        TensorDataset(torch.from_numpy(X_attack)),
         batch_size=cfg["mlp_batch_size"], shuffle=False
     )
     with torch.no_grad():
@@ -217,7 +182,6 @@ def main():
 
     # save outputs
     np.save(os.path.join(cfg["output_dir"], "inference_scores.npy"), scores)
-    np.save(os.path.join(cfg["output_dir"], "proxy_losses.npy"),     proxy_losses)
     print(f"\n  member scores     mean={scores[y_member==1].mean():.3f}  "
           f"std={scores[y_member==1].std():.3f}")
     print(f"  non-member scores mean={scores[y_member==0].mean():.3f}  "

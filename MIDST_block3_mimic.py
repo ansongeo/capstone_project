@@ -1,22 +1,19 @@
 """
 MIDST MIA -- Block 3: Train Meta-Classifier
 ============================================
-Reads loss_matrix (N, K) + label_matrix (N, K) from Block 2 and trains
-an MLP meta-classifier:
+Reads the synth-shadow loss features and labels from Block 2 and trains an
+MLP meta-classifier on every (patient, shadow) pair:
 
-    M: R^1 -> P(member)
-    input  = relative scalar loss per (patient, shadow) pair
+    M: R^d -> P(member)
+    input  = the patient's loss summaries under synth-shadow k
     output = raw logit for membership probability
 
-The MLP learns: negative relative loss -> member, positive -> non-member.
-
-With 50/50 splits the positive rate is exactly 50% so no class reweighting
-is needed -- BCEWithLogitsLoss is used without pos_weight.
+With 50/50 splits the positive rate is exactly 50%.
 
 Outputs saved to output_dir/
   meta_classifier.pt   -- MLP weights (best val AUC checkpoint)
 
-Run next: MIDST_block4_inference_eval.py
+Run next: MIDST_block4_mimic.py
 """
 
 import os
@@ -27,7 +24,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from midst_common import DATASETS, parse_cli, MetaClassifierMLP
+from midst_common import (DATASETS, parse_cli, MetaClassifierMLP, flat_features,
+                          features_dir)
 
 
 # =============================================================================
@@ -52,27 +50,24 @@ CONFIG = {
 # DATASET BUILDING
 # =============================================================================
 
-def build_meta_dataset(loss_matrix, label_matrix):
+def build_meta_dataset(cfg):
     """
-    Pool all N * K (relative_loss, label) pairs.
-
-    loss_matrix  : (N, K)  -- relative scalar loss per (patient, shadow)
-    label_matrix : (N, K)  -- 1 if patient was in Dk_train for split k
-
-    Positive rate reflects split_train_frac (e.g. 80% for 80/20 splits).
+    Pool all N * K (features, label) pairs from Block 2.
 
     Returns
     -------
-    features : (N*K, 1)  float32
+    features : (N*K, d)  float32
     labels   : (N*K,)    float32
     """
-    N, K     = loss_matrix.shape
-    features = loss_matrix.flatten().reshape(-1, 1).astype(np.float32)
-    labels   = label_matrix.flatten().astype(np.float32)
+    d  = features_dir(cfg)
+    ks = sorted(int(f[2:4]) for f in os.listdir(d) if f.startswith("ss"))
+    features = np.concatenate([flat_features(np.load(os.path.join(d, f"ss{k:02d}.npy")))
+                               for k in ks]).astype(np.float32)
+    labels   = np.concatenate([np.load(os.path.join(d, f"lab{k:02d}.npy"))
+                               for k in ks]).astype(np.float32)
     idx      = np.random.permutation(len(labels))
     print(f"  pooled dataset : {features.shape}  "
-          f"positive rate={100*labels.mean():.1f}%  "
-          f"(N={N}, K={K})")
+          f"positive rate={100*labels.mean():.1f}%  (K={len(ks)} shadows)")
     return features[idx], labels[idx]
 
 
@@ -172,41 +167,8 @@ def main():
     os.makedirs(cfg["output_dir"], exist_ok=True)
     print(f"[config]  device={cfg['device']}  output_dir={cfg['output_dir']}")
 
-    loss_path  = os.path.join(cfg["output_dir"], "loss_matrix.npy")
-    label_path = os.path.join(cfg["output_dir"], "label_matrix.npy")
-    assert os.path.exists(loss_path),  \
-        f"Missing {loss_path} -- run Block 2 first."
-    assert os.path.exists(label_path), \
-        f"Missing {label_path} -- run Block 2 first."
-
-    print("\n[load] Loading loss_matrix and label_matrix ...")
-    loss_matrix  = np.load(loss_path)
-    label_matrix = np.load(label_path)
-    print(f"  loss_matrix  : {loss_matrix.shape}")
-    print(f"  label_matrix : {label_matrix.shape}")
-
-    # sanity check -- warn if any splits are all zeros (Block 2 incomplete)
-    empty_splits = (loss_matrix == 0).all(axis=0).sum()
-    if empty_splits > 0:
-        print(f"  WARNING: {empty_splits}/{loss_matrix.shape[1]} splits are "
-              f"all zeros -- Block 2 may be incomplete.")
-
-    # clip extreme outliers per split at p99 before building the dataset.
-    # max values reach 1400-6900 but p99 is only 47-69 -- these outliers
-    # inflate the loss scale and confuse the MLP. clipping at p99 per split
-    # keeps the training distribution consistent with proxy losses at inference
-    # (proxy max ~62, well within p99 range).
-    print("\n[Block 3] Clipping loss_matrix outliers at per-split p99 ...")
-    for k in range(loss_matrix.shape[1]):
-        p99 = np.percentile(loss_matrix[:, k], 99)
-        n_clipped = (loss_matrix[:, k] > p99).sum()
-        loss_matrix[:, k] = np.clip(loss_matrix[:, k], -np.inf, p99)
-        print(f"  k={k+1:2d}  p99={p99:.3f}  clipped={n_clipped} patients")
-    print(f"  After clipping: max={loss_matrix.max():.3f}  "
-          f"std={loss_matrix.std():.3f}")
-
     print("\n[Block 3] Building meta-classifier training data ...")
-    meta_X, meta_y = build_meta_dataset(loss_matrix, label_matrix)
+    meta_X, meta_y = build_meta_dataset(cfg)
 
     print("\n[Block 3] Training meta-classifier ...")
     meta_clf = train_meta_classifier(meta_X, meta_y, cfg)
@@ -214,7 +176,7 @@ def main():
     save_path = os.path.join(cfg["output_dir"], "meta_classifier.pt")
     torch.save(meta_clf.state_dict(), save_path)
     print(f"\n[Block 3 done]  Meta-classifier saved to {save_path}")
-    print("  Run next: MIDST_block4_inference_eval.py")
+    print("  Run next: MIDST_block4_mimic.py")
 
 
 if __name__ == "__main__":

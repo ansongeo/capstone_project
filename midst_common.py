@@ -2,7 +2,7 @@
 MIDST MIA -- code shared by Blocks 0-4
 ======================================
 Dataset configs, preprocessing, model construction, training, sampling and
-loss extraction were copied into every block; they live here now so that a
+loss features were copied into every block; they live here now so that a
 change is made once.
 """
 
@@ -435,81 +435,80 @@ def generate_synthetic(diffusion, n_samples, batch_size, device, seed=None):
 
 
 # =============================================================================
-# LOSS EXTRACTION
+# LOSS FEATURES
 # =============================================================================
+# Per record and per diffusion step t in T_GRID, the model's Gaussian (vital
+# signs, eps-MSE) and categorical (missing-value flags + mortality) losses are
+# computed separately under N_DRAW noise draws. The draws are frozen (same
+# seed for every model), so the only difference between two models' features
+# is the models, not sampling noise. Each record keeps summaries of its N_DRAW
+# losses: mean, std, min, max, 10th/50th/90th percentile, over the first
+# 100 / 300 / 600 draws.
+
+T_GRID     = (0, 1, 2, 5, 10, 20, 30, 40, 50, 75, 100, 150, 200, 300, 500, 750)
+N_DRAW     = 600
+BUDGETS    = (100, 300, 600)
+NOISE_SEED = 1234
+STATS      = ("mean", "std", "min", "max", "q10", "q50", "q90")
+
+
+def _stats(L):
+    """L: (n, N_DRAW) on GPU -> (n, len(BUDGETS), 7)."""
+    out = []
+    for b in BUDGETS:
+        x = L[:, :b]
+        q = torch.quantile(x, torch.tensor([.1, .5, .9], device=x.device), dim=1).T
+        out.append(torch.stack([x.mean(1), x.std(1), x.min(1).values, x.max(1).values,
+                                q[:, 0], q[:, 1], q[:, 2]], 1))
+    return torch.stack(out, 1)
+
 
 @torch.no_grad()
-def get_loss_vector(diffusion, X, cfg, n_samples=None, batch_size=128):
-    """Returns averaged scalar loss per patient. Shape (N,)."""
-    if n_samples is None:
-        n_samples  = cfg["n_loss_samples"]
-    device     = cfg["device"]
-    diffusion  = diffusion.to(device).eval()
-    total      = np.zeros(len(X), dtype=np.float64)
+def loss_features(cfg, diffusion, Xn, rows=4096):
+    """
+    Xn: (n, C, T) records scaled like the model's training data.
+    Returns (n, len(T_GRID), 2, len(BUDGETS), 7) float32:
+    [Gaussian, categorical] loss summaries per t.
+    """
+    from midst_fast import FastMixedLoss
+    kw  = cfg[cfg["dataset"]]["diffusion_kwargs"]
+    num = kw["numerical_features_indices"]
+    cat = kw["categorical_features_indices"]
+    dev = cfg["device"]
+    diffusion = diffusion.to(dev).eval()
+    fl = FastMixedLoss(diffusion, num, cat)
+    X = torch.tensor(Xn, device=dev)
+    n, L = len(X), X.shape[2]
+    g = torch.Generator(device="cpu").manual_seed(NOISE_SEED)
+    eps = torch.randn(N_DRAW, len(num), L, generator=g).to(dev)
+    gum = torch.rand(N_DRAW, len(cat), 2, L, generator=g).to(dev)
+    out = torch.empty((n, len(T_GRID), 2, len(BUDGETS), 7))
+    for ti, tv in enumerate(T_GRID):
+        G = torch.empty((n, N_DRAW), device=dev)
+        C = torch.empty((n, N_DRAW), device=dev)
+        for s in range(0, n, rows):
+            x = X[s:s + rows]
+            b = len(x)
+            t = torch.full((b,), tv, device=dev, dtype=torch.long)
+            for r in range(N_DRAW):
+                gs, cs, _ = fl(x, t=t, noise=eps[r].expand(b, -1, -1),
+                               gumbel_u=gum[r].expand(b, -1, -1, -1), return_parts=True)
+                G[s:s + b, r] = gs
+                C[s:s + b, r] = cs
+        out[:, ti, 0] = _stats(G).cpu()
+        out[:, ti, 1] = _stats(C).cpu()
+    return out.numpy().astype(np.float32)
 
-    try:
-        for _ in range(n_samples):
-            chunk = []
-            for (xb,) in DataLoader(TensorDataset(X),
-                                    batch_size=batch_size, shuffle=False):
-                xb = nan_to_zero(xb).to(device)
-                t  = torch.randint(0, diffusion.num_timesteps,
-                                   (xb.size(0),), device=device).long()
-                loss = _per_sample_loss(diffusion, xb, t)
-                chunk.append(loss.cpu().numpy())
-            total += np.concatenate(chunk)
-    finally:
-        diffusion.cpu()
 
-    return (total / n_samples).astype(np.float32)
+def flat_features(F):
+    """(n, nT, 2, nB, 7) -> (n, d): every summary at the largest draw budget."""
+    return F[:, :, :, -1].reshape(len(F), -1)
 
 
-def _per_sample_loss(diffusion, x_start, t):
-    from models.ETDiff.mixed_diffusion import index_to_log_onehot
-    import torch.nn.functional as F
-    from einops import reduce
-    import models.ETDiff.utils as utils
-
-    pt     = torch.ones_like(t).float() / diffusion.num_timesteps
-
-    # --- numerical ---
-    # diffusion.forward() calls normalize_numericals() before mixed_loss(),
-    # applying normalize_to_neg_one_to_one (x*2-1) to numerical features.
-    # We must apply the same normalization here so loss extraction uses
-    # the same [-1,1] inputs as training -- without this the model sees
-    # out-of-distribution inputs and assigns noisy, uninformative losses.
-    x_num = diffusion.extract_features(x_start, "numerical")
-    x_num = diffusion.normalize(x_num)          # [0,1] -> [-1,1]
-    noise   = torch.randn_like(x_num)
-    x_num_t = diffusion.gauss_q_sample(x_num, t, noise=noise)
-
-    # --- categorical ---
-    x_cat       = diffusion.extract_features(x_start, "categorical")
-    log_x_cat   = index_to_log_onehot(x_cat.long(),
-                                       diffusion.categorical_num_classes)
-    log_x_cat_t = diffusion.cat_q_sample(log_x_start=log_x_cat, t=t)
-
-    # --- model forward ---
-    x_in      = torch.cat([x_num_t, log_x_cat_t], dim=1)
-    model_out = diffusion.model(x_in, t, None)
-    out_num   = diffusion.extract_modeloutput(model_out, "numerical")
-    out_cat   = diffusion.extract_modeloutput(model_out, "categorical")
-
-    # --- gaussian loss (per sample) ---
-    # gauss_loss() in mixed_diffusion returns a scalar (.mean() at the end)
-    # replicate without final mean to get shape (B,)
-    g = F.mse_loss(out_num, noise, reduction="none")   # (B, num_ch, T)
-    g = reduce(g, "b ... -> b (...)", "mean")           # (B, num_ch*T)
-    g = g * utils.extract(diffusion.loss_weight, t, g.shape)
-    loss_gauss = g.mean(dim=-1)                         # (B,)
-
-    # --- categorical loss (per sample) ---
-    # cat_loss() returns (B,) via sum_except_batch -- use directly
-    loss_multi = diffusion.cat_loss(
-        out_cat, log_x_cat, log_x_cat_t, t, pt, None
-    ) / len(diffusion.categorical_num_classes)          # (B,)
-
-    return diffusion.loss_lambda * loss_multi + loss_gauss  # (B,)
+def features_dir(cfg):
+    d = os.path.join(cfg["output_dir"], "features")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 # =============================================================================
